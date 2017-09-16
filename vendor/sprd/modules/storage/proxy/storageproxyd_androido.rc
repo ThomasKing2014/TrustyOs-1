@@ -1,0 +1,9 @@
+on post-fs-data
+    mkdir /data/sprd_ss 0770 system system
+    start storageproxyd
+
+service storageproxyd /system/bin/sprdstorageproxyd -d /dev/trusty-ipc-dev0 -p /data/sprd_ss -r /dev/block/mmcblk0rpmb
+    class late_start
+    group root system
+    disabled
+    seclabel u:r:tee:s0

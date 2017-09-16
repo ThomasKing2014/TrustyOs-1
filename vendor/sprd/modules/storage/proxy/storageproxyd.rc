@@ -1,0 +1,10 @@
+# property is ok means real data partition mounted
+on property:vold.realdata.mount=ok
+    mkdir /data/ss 0770 system system
+    start storageproxyd
+
+service storageproxyd /system/bin/sprdstorageproxyd -d /dev/trusty-ipc-dev0 -p /data/ss -r /dev/block/mmcblk0rpmb
+    class late_start
+    group root system
+    disabled
+    seclabel u:r:tee:s0

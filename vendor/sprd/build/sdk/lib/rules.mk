@@ -1,0 +1,16 @@
+LOCAL_DIR := $(GET_LOCAL_DIR)
+
+MODULE := $(LOCAL_DIR)
+
+MODULE_DEPS := \
+	app/trusty \
+
+MODULE_DEPS += $(LIBRARY_SDK_EXPORTED)
+
+MODULE_SRCS := \
+	$(LOCAL_DIR)/manifest.c \
+	$(LOCAL_DIR)/lib.c
+
+GLOBAL_DEFINES += WITH_LIB_TRUSTY_VERSION=1
+
+include make/module.mk

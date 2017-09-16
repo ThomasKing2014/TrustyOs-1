@@ -1,0 +1,1 @@
+vendor/sprd/build/lk_inc.mk

@@ -1,0 +1,312 @@
+#!/usr/bin/env python
+
+from argparse import ArgumentParser, FileType, Action
+from struct import pack, unpack
+import shutil,os
+
+APP_TAG_MAGIC = 'TAG:PREBUILT.TRUSTY.APPS'
+APP_TAG_MAGIC_LEN = 0x20; 
+# ta elf magic string: '0x7f'+'ELF'+32bitsLSBv1
+APP_ELF_MAGIC = '\x7fELF\x01\x01\x01'
+# Magic code + tos base address(8B) + tos end address(8B) + ta base address(8B) + cnt/isrecord(4B)
+APP_TAG_LEN = 0x3c; 
+# uuid(16B) + type(4B) + start(4B) + end(4B) + pad(4B) + buit_time(32B)
+EXT_APP_ENTRY_LEN = 0x40;
+BUILT_TSTAMP_MAGIC = 'Built: '
+BUILT_TSTAMP_LEN = 0x14;
+# max external TA cnt
+EXT_APP_MAX_CNT = 0x20;
+
+def print_ta_head():
+    width=100;uuidw=45;startw=15;endw=15;builtw=width-uuidw-startw-endw
+    header_fmt = '%-*s%*s%*s%*s'
+    print('='*width)
+    print(header_fmt % (uuidw,'UUID',startw,'Start',endw,'End',builtw,'Built'))
+    print('-'*width)
+
+def print_ta_entry(uuid, start, end, built):
+    width=100;uuidw=45;startw=15;endw=15;builtw=width-uuidw-startw-endw
+    s_uuid = unpack("<I2H8B", uuid)
+    fmted_uuid = "{%08x-%04x-%04x-%02x-%02x-%02x-%02x-%02x-%02x-%02x-%02x}" % s_uuid
+    entry_fmt = '%-*s%*s%*s%*s'
+    print(entry_fmt % (uuidw,fmted_uuid,startw,'0x'+"%x"%start,endw,'0x'+"%x"%end,builtw,built))
+
+def print_ta_tail():
+    width=100
+    print('='*width+'\n')
+
+def record_ta(f_tos, tos_img, magic_end, uuid, start, end, built_ts, tacnt_list, true_record=True):
+    j=0; empty_slot_entry=-1
+    ta_built_ts = tos_img.find(BUILT_TSTAMP_MAGIC, start, end+1)
+    if ta_built_ts == -1:
+        ta_built = tos_img[built_ts+7:built_ts+7+BUILT_TSTAMP_LEN]
+    else:
+        ta_built = tos_img[ta_built_ts+7:ta_built_ts+7+BUILT_TSTAMP_LEN]
+
+    # check if have been recorded
+    while j < EXT_APP_MAX_CNT:
+        entry_start = magic_end+28+EXT_APP_ENTRY_LEN*j;
+        ouuid, type, ostart, oend, p, built = unpack('16s4I32s',tos_img[entry_start:entry_start+EXT_APP_ENTRY_LEN])
+        if ((type == 0x0) and (empty_slot_entry == -1)):
+            empty_slot_entry = entry_start
+        if ((type != 0x0) and (ouuid == uuid)):
+            break;
+        j += 1
+
+    # record ta if have not been recorded in TAG Table
+    if (j == EXT_APP_MAX_CNT) and (empty_slot_entry != -1):
+        if (true_record == True):
+            f_tos.seek(empty_slot_entry)
+            f_tos.write(pack("16s4I32s", uuid, 0xFFFF0001, start, end, 0, ta_built))
+            f_tos.flush()
+        tacnt_list[0] += 1
+
+    return ' '*5+ta_built
+
+
+def parse_uuid(tos_img, ta_start, next_ta_start):
+    uuid = ''
+    # valid ELF??
+    begin = ta_start
+    magic, = unpack('<I',tos_img[begin:begin+4])
+    if magic != 0x464c457f:
+        raise ValueError('Not a valid ELF image')
+
+    # get sh_entry_size/sh_num, offset at 16+30 Bytes
+    begin = ta_start+16+16
+    shoff, = unpack('<I',tos_img[begin:begin+4])
+    begin = ta_start+16+30
+    shent_size,shnum,shstrndx = unpack('<3H',tos_img[begin:begin+6])
+    next_ta_start[0] = ta_start + shoff + shent_size * shnum
+
+    # read string table
+    strshpos = ta_start + shoff + shstrndx*shent_size + 4*4
+    strpos,strlen = unpack('<2I',tos_img[strshpos:strshpos+8])
+    rawstring = tos_img[ta_start+strpos:ta_start+strpos+strlen]
+
+    # read manifest section
+    for index in range(shnum):
+        secpos = ta_start + shoff + index*shent_size
+        secheadval = unpack("<iiiiiiiiii", tos_img[secpos:secpos+shent_size])
+        sec_name = (rawstring[secheadval[0]:].split('\0'))[0]
+        if sec_name == '.trusty_app.manifest':
+            uuid = tos_img[ta_start+secheadval[4]:ta_start+secheadval[4]+16]
+
+    return uuid
+
+
+def parse_int(x):
+    return int(x, 0)
+
+def pad_file(f, padding):
+    pad = (padding - (f.tell() & (padding - 1))) & (padding - 1)
+    f.write(pack(str(pad) + 'x'))
+
+def parse_cmdline():
+    parser = ArgumentParser()
+    parser.add_argument('--tos', help='path to the tos binary', required=True)
+    parser.add_argument('-l', '--list', help="list all TAs in TOS bin", action="store_true",default=False)
+    parser.add_argument('-d', '--delete', help="delete one TA(indicated by -u) from TOS bin", action="store_true",default=False)
+    parser.add_argument('-u', '--uuid', help='uuid of the TA to delete',required=False)
+    parser.add_argument('--ta', help='path to the TA(elf)', type=FileType('rb'),
+                        required=False)
+    parser.add_argument('--padsize', help='page size', type=parse_int, default=4096)
+    parser.add_argument('-o', '--output', help='output file name',
+            required=False)
+    return parser.parse_args()
+
+
+def list_tas(args):
+    f_tos = open(args.tos, 'rb')
+    tos_img = f_tos.read()
+    tag_offset = tos_img.rfind(APP_TAG_MAGIC)
+    built_tstamp = tos_img.find(BUILT_TSTAMP_MAGIC)
+    magic_end = tag_offset + APP_TAG_LEN - 28;
+
+    # list all TAs recorded in TAG Table
+    base, limit, tabase, tacnt, is_recorded = unpack('3L2H',tos_img[magic_end:magic_end+28])
+
+    assert 0 <= tacnt < EXT_APP_MAX_CNT
+    if tabase == 0:
+        first_ta = tos_img.find(APP_ELF_MAGIC)
+        tabase = base+(first_ta&(~(4096-1)))
+	#print("base: 0x%x first_ta: 0x%x tabase: 0x%x" % (tabase,first_ta,tabase))
+
+
+    print("\nAll TAs:")
+    print_ta_head()
+
+    # list TAs wasn't recorded
+    next_tas_start = [0]; start = tabase-base; tacnt_list = [tacnt]
+    while next_tas_start[0] < (limit-base):
+        #seek and reread
+        uuid = parse_uuid(tos_img, start, next_tas_start)
+        bts = record_ta(f_tos, tos_img, magic_end, uuid, start,
+                next_tas_start[0]-1, built_tstamp, tacnt_list,
+                true_record=False)
+        f_tos.seek(0)
+        tos_img = f_tos.read()
+        print_ta_entry(uuid,start,next_tas_start[0]-1,bts)
+        start = next_tas_start[0]
+
+    print_ta_tail()
+    #is_recorded = 1
+    #f_tos.seek(magic_end)
+    #f_tos.write(pack("3I2H", base, limit, tabase, tacnt_list[0], is_recorded))
+
+
+def delete_tas(args):
+    print("delete tas from tos bin")
+    tmp_tos = args.tos + '.tmp'
+    if os.path.exists(args.tos) and not os.path.exists(tmp_tos):
+        shutil.copy(args.tos,tmp_tos)
+
+    f_tos = open(tmp_tos, 'r+b')
+    tos_img = f_tos.read()
+
+    tag_offset = tos_img.rfind(APP_TAG_MAGIC)
+    built_tstamp = tos_img.find(BUILT_TSTAMP_MAGIC)
+    magic_end = tag_offset + APP_TAG_LEN - 28;
+
+    print("len(tos_img)=%x,tag_offset=%x,args.padsize=%x\n" % (len(tos_img),tag_offset,args.padsize))
+    if len(tos_img) != tag_offset + args.padsize:
+        raise ValueError('The location of magic code does not match this image')
+
+    # Parse tos base address and app end address
+    base, limit, tabase, tacnt, is_recorded = unpack('3L2H',tos_img[magic_end:magic_end+28])
+    if tabase == 0:
+        first_ta = tos_img.find(APP_ELF_MAGIC)
+        tabase = base+(first_ta&(~(4096-1)))
+
+    # do ta-recording first in old tos.bin if haven't 
+    if is_recorded != 1:
+        next_tas_start = [0]; start = tabase-base; tacnt_list = [tacnt]
+        while next_tas_start[0] < (limit-base):
+            #changed tos.bin, so reseek and reread
+            uuid = parse_uuid(tos_img, start, next_tas_start)
+            record_ta(f_tos, tos_img, magic_end, uuid, start, next_tas_start[0]-1, built_tstamp, tacnt_list)
+            f_tos.seek(0)
+            tos_img = f_tos.read()
+            start = next_tas_start[0]
+        is_recorded = 1
+        tacnt = tacnt_list[0]
+        f_tos.seek(magic_end)
+        f_tos.write(pack("3L2H", base, limit, tabase, tacnt_list[0], is_recorded))
+    f_tos.close();
+
+
+    # Write the orginal tos image data except all TAs
+    f_out = open(args.output, 'w+b')
+    f_out.write(tos_img[:(tabase - base)])
+
+    # write all other TAs except the to-be-deleted TA
+    j=0;del_end=1;del_start=0
+    while j < EXT_APP_MAX_CNT:
+        entry_start = magic_end+28+EXT_APP_ENTRY_LEN*j;
+        ouuid, type, ostart, oend, p, obuilt = unpack('16s4I32s',tos_img[entry_start:entry_start+EXT_APP_ENTRY_LEN])
+        s_uuid = unpack("<I2H8B", ouuid)
+        fmted_ouuid = "%8x-%0x-%04x-%02x-%02x-%02x-%02x-%02x-%02x-%02x-%02x" % s_uuid
+        if ((type != 0x0) and (fmted_ouuid != args.uuid)):
+            f_out.write(tos_img[ostart:oend+1])
+        if ((type != 0x0) and (fmted_ouuid == args.uuid)):
+            del_start=ostart; del_end=oend
+        j += 1
+
+    # Write magic code with padding
+    print("old limit: 0x%x" % limit)
+    nlimit = limit-(del_end-del_start+1)
+    f_out.seek(tag_offset)
+    f_out.write(pack("32s", APP_TAG_MAGIC))
+    f_out.write(pack("3L2H", base, nlimit, tabase, 0, 0))
+
+    # do ta-recording in the new-out tos.bin
+    pad_file(f_out, args.padsize)
+    f_out.seek(0)
+    ntos_img = f_out.read()
+    next_tas_start = [0]; start = tabase-base; tacnt_list = [0]; 
+    while next_tas_start[0] < (nlimit-base):
+        #changed tos.bin, so reseek and reread
+        uuid = parse_uuid(ntos_img, start, next_tas_start)
+        record_ta(f_out, ntos_img, magic_end, uuid, start, next_tas_start[0]-1, built_tstamp, tacnt_list)
+        f_out.seek(0)
+        ntos_img = f_out.read()
+        start = next_tas_start[0]
+
+    f_out.seek(magic_end)
+    f_out.write(pack("3L2H", base, nlimit, tabase, tacnt-1, 1))
+    f_out.close();
+    os.remove(tmp_tos)
+
+
+def add_tas(args):
+    f_tos = open(args.tos, 'rb')
+    tos_img = f_tos.read()
+    f_tos.close()
+
+    ta_img = args.ta.read()
+
+    tag_offset = tos_img.rfind(APP_TAG_MAGIC)
+    built_tstamp = ta_img.find(BUILT_TSTAMP_MAGIC)
+    magic_end = tag_offset + APP_TAG_LEN - 28;
+
+    print("len(tos_img)=%x,tag_offset=%x,args.padsize=%x\n" % (len(tos_img),tag_offset,args.padsize))
+    if len(tos_img) != tag_offset + args.padsize:
+        raise ValueError('The location of magic code does not match this image')
+
+    # Parse tos base address and app end address
+    base, limit, tabase, tacnt, is_recorded = unpack('3L2H',tos_img[magic_end:magic_end+28])
+    if limit - base + args.padsize + len(ta_img) > len(tos_img):
+        raise ValueError('TA image size is too large')
+    if tabase == 0:
+        first_ta = tos_img.find(APP_ELF_MAGIC)
+        tabase = base+(first_ta&(~(4096-1)))
+
+    print("tag offset: 0x%x\ntos ram base: 0x%x\nta base: 0x%x\ntos limit \
+            offset: 0x%x\nexternal ta count: 0x%x\nis_recorded: 0x%x\n"
+           % (tag_offset, base, tabase, limit, tacnt, is_recorded))
+
+    # Write the orginal tos image data except padding
+    f_out = open(args.output, 'wb')
+    f_out.write(tos_img[:(limit - base)])
+
+    # Write TA elf
+    f_out.write(ta_img)
+    uuid = parse_uuid(ta_img, 0, [0])
+
+    # Write magic code with padding
+    f_out.seek(tag_offset)
+    f_out.write(pack("32s", APP_TAG_MAGIC))
+    f_out.write(pack("3L2H", base, limit + len(ta_img), tabase, tacnt+1, is_recorded))
+    print("update app limit: 0x%x" % (limit + len(ta_img)))
+
+    j=0
+    while j < EXT_APP_MAX_CNT:
+        entry_start = magic_end+28+EXT_APP_ENTRY_LEN*j;
+        ouuid, type, ostart, oend, p, obuilt = unpack('16s4I32s',tos_img[entry_start:entry_start+EXT_APP_ENTRY_LEN])
+        f_out.seek(entry_start)
+        if type == 0x0:
+            f_out.write(pack("16s4I32s", uuid, 0xFFFF0001, limit-base,
+                limit-base+len(ta_img)-1, 0,
+                ta_img[built_tstamp+7:built_tstamp+7+BUILT_TSTAMP_LEN]))
+            break
+        else:
+            f_out.write(pack("16s4I32s", ouuid, type, ostart, oend, 0, obuilt))
+            j += 1
+            continue
+
+    pad_file(f_out, args.padsize)
+
+    f_out.close();
+
+
+def main():
+    args = parse_cmdline()
+    if (args.list == True):
+        list_tas(args)
+    elif(args.delete == True):
+        delete_tas(args)
+    else:
+        add_tas(args)
+
+if __name__ == '__main__':
+    main()
